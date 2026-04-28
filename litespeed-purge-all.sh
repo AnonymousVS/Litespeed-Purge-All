@@ -7,6 +7,10 @@
 # Usage   : bash /usr/local/sbin/litespeed-purge-all.sh
 # ─────────────────────────────────────────────────────────────────────────────
 # CHANGELOG:
+#   v2.5.1 | 2026-04-29 11:00 | Fix: LAST_RESULT ไม่กลับจาก subshell
+#           |                  | do_purge echo "PURGE_RESULT:" ออก stdout
+#           |                  | run_with_spinner parse กลับมาตั้ง LAST_RESULT
+#           |                  | แก้ [FAIL] log แสดงสาเหตุว่างเปล่า
 #   v2.5.0 | 2026-04-29 10:00 | เขียนใหม่ตาม wp-bulk-permalink-flush.sh pattern
 #           |                  | Menu แบบ read-once (mode 1 / mode 2)
 #           |                  | Mode 2 เลือก multiple cPanel (space/comma)
@@ -18,7 +22,7 @@
 #   v2.0.0 | 2026-04-28 16:00 | Rewrite: wp litespeed-purge all
 ###############################################################################
 
-VERSION="2.5.0"
+VERSION="2.5.1"
 
 # ── Telegram (แก้ค่าตรงนี้) ────────────────────────────────────────────────
 TELEGRAM_ENABLED=false
@@ -392,7 +396,17 @@ run_with_spinner() {
         sleep 0.08
     done
     wait "$bg"; local ec=$?
-    LAST_OUTPUT=$(cat "$tmp"); rm -f "$tmp"
+
+    local raw_output
+    raw_output=$(cat "$tmp"); rm -f "$tmp"
+
+    # ── แยก PURGE_RESULT line ออกจาก output ──────────────────────────────
+    # do_purge echo "PURGE_RESULT:<value>" ออก stdout เพื่อส่งกลับ parent
+    # เพราะ variable ที่ set ใน subshell (&) ไม่กลับมาถึง parent shell
+    LAST_RESULT=$(printf '%s\n' "$raw_output" \
+        | grep "^PURGE_RESULT:" | tail -1 | cut -c14-)
+    LAST_OUTPUT=$(printf '%s\n' "$raw_output" \
+        | grep -v "^PURGE_RESULT:")
 
     if [[ $ec -eq 0 ]]; then
         printf "\r  ${CYAN}[%4d/%-4d]${RESET}  %-52s  ${GREEN}✔ OK${RESET}\n" \
@@ -405,21 +419,27 @@ run_with_spinner() {
 }
 
 ###############################################################################
-# do_purge — core purge logic (รันผ่าน run_with_spinner)
-# ตั้ง LAST_RESULT และ exit code:
-#   0 = SUCCESS (LS OK + CF OK / CF not configured)
-#   1 = CF issue (LS OK แต่ CF มีปัญหา) → นับแยก CNT_CF_ISSUE ข้างนอก
+# do_purge — core purge logic (รันผ่าน run_with_spinner ใน background subshell)
+#
+# ⚠️  ห้าม set variable ใน function นี้แล้วหวังว่าจะกลับไป parent shell
+#     เพราะ & = subshell — variable ไม่ propagate กลับ parent เด็ดขาด
+#
+# วิธีส่งผลลัพธ์กลับ:
+#   echo "PURGE_RESULT:<value>"  → stdout → $tmp → LAST_RESULT ใน parent
+#
+# Exit code:
+#   0 = SUCCESS
+#   1 = CF issue (LS OK แต่ CF มีปัญหา)
 #   2 = LS FAILED
 ###############################################################################
 do_purge() {
     local domain="$1" cpuser="$2" wp_path="$3" wp_url="${4:-$1}"
-    LAST_RESULT=""
 
     # ── Plugin active check ──────────────────────────────────────────────
-    # "Status: active" ไม่ใช่ "active" เพราะ "Inactive" มี substring "active"
+    # ใช้ "Status: active" ไม่ใช่ "active" เพราะ "Inactive" มี substring "active"
     if ! sudo -u "$cpuser" $PHP_CLI "$WP_CLI" --path="$wp_path" \
         plugin status litespeed-cache 2>&1 | grep -qi "Status: active"; then
-        LAST_RESULT="LS_PLUGIN_INACTIVE"
+        echo "PURGE_RESULT:LS_PLUGIN_INACTIVE"
         return 2
     fi
 
@@ -437,13 +457,13 @@ do_purge() {
     if ! ([[ $purge_exit -eq 0 ]] && echo "$purge_out" | grep -qi "^Success:"); then
         local err
         err=$(echo "$purge_out" | grep -i "^Error:" | head -1)
-        LAST_RESULT="LS_FAILED: ${err:-exit=${purge_exit}}"
+        echo "PURGE_RESULT:LS_FAILED:${err:-exit=${purge_exit}}"
         return 2
     fi
 
     # ── STEP 2: CF notices ───────────────────────────────────────────────
     if [[ "$cf_configured" == "0" ]]; then
-        LAST_RESULT="SUCCESS"
+        echo "PURGE_RESULT:SUCCESS"
         return 0
     fi
 
@@ -461,18 +481,18 @@ do_purge() {
     echo "$notices" | grep -qF "Cloudflare API is set to off."                  && cf_api_off=1
 
     if [[ $cf_comm_ok -eq 1 && $cf_purge_ok -eq 1 ]]; then
-        LAST_RESULT="SUCCESS"
+        echo "PURGE_RESULT:SUCCESS"
         return 0
     elif [[ $cf_zone_missing -eq 1 ]]; then
-        LAST_RESULT="CF_ZONE_MISSING"
+        echo "PURGE_RESULT:CF_ZONE_MISSING"
     elif [[ $cf_conn_failed -eq 1 ]]; then
-        LAST_RESULT="CF_CONN_FAILED"
+        echo "PURGE_RESULT:CF_CONN_FAILED"
     elif [[ $cf_api_off -eq 1 ]]; then
-        LAST_RESULT="CF_DISABLED"
+        echo "PURGE_RESULT:CF_DISABLED"
     elif [[ $cf_comm_ok -eq 1 && $cf_purge_ok -eq 0 ]]; then
-        LAST_RESULT="CF_PURGE_FAILED"
+        echo "PURGE_RESULT:CF_PURGE_FAILED"
     else
-        LAST_RESULT="CF_UNCONFIRMED"
+        echo "PURGE_RESULT:CF_UNCONFIRMED"
     fi
     return 1   # CF issue — LS purge สำเร็จ แต่ CF มีปัญหา
 }
