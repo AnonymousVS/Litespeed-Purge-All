@@ -1,21 +1,25 @@
 #!/bin/bash
 ###############################################################################
 # litespeed-purge-all.sh
-# Version  : 2.2.0
+# Version  : 2.4.0
 # Location : /usr/local/sbin/litespeed-purge-all.sh
 # Usage    : bash /usr/local/sbin/litespeed-purge-all.sh
 # ─────────────────────────────────────────────────────────────────────────────
 # CHANGELOG:
-# v2.2.0 | 2026-04-28 17:30 | ลบ server-config.conf — ตั้งค่า Telegram
-#        |                   | ใน script โดยตรง ลบ SERVER_NAME / WP_CLI_PATH
-# v2.1.0 | 2026-04-28 17:00 | เพิ่ม interactive menu (All / by cPanel account)
-#        |                   | เพิ่ม Telegram notification + spinner
+# v2.4.0 | 2026-04-29 09:00 | แก้ build_domain_map: อ่าน trueuserdomains +
+#        |                   | userdatadomains, กรอง main/sub/nobody/*/internal
+#        |                   | รองรับ Parked/Alias domain (ใช้ parent docroot)
+#        |                   | get_wp_path รองรับ 2 path structures
+#        |                   | Log fixed filename เขียนทับ (ไม่บวม)
+#        |                   | CF_ZONE_MISSING fix message อัปเดต
+# v2.3.0 | 2026-04-29 08:00 | CF detection exact strings จาก cloudflare.cls.php
+# v2.2.0 | 2026-04-28 17:30 | ลบ server-config.conf, Telegram inline
+# v2.1.0 | 2026-04-28 17:00 | Interactive menu + Telegram + spinner
 # v2.0.0 | 2026-04-28 16:00 | Rewrite: wp litespeed-purge all + CF notice check
-#        |                   | แก้ Bug plugin status / check_cf_configured
 # v1.0.0 | 2026-04-28 12:00 | Initial release
 ###############################################################################
 
-VERSION="2.2.0"
+VERSION="2.4.0"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m';    GREEN='\033[0;32m';  YELLOW='\033[1;33m'
@@ -27,11 +31,10 @@ TELEGRAM_ENABLED=false
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 
-# ── Log ───────────────────────────────────────────────────────────────────────
+# ── Log — Fixed filename เขียนทับทุกครั้ง (ไม่บวม) ─────────────────────────
 LOG_DIR="/var/log/ls-purge-all"
-TIMESTAMP=$(TZ='Asia/Bangkok' date '+%Y%m%d_%H%M%S')
-LOG_FILE="${LOG_DIR}/purge_${TIMESTAMP}.log"
-FAIL_LOG="${LOG_DIR}/purge_FAIL_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/purge.log"
+FAIL_LOG="${LOG_DIR}/purge_fail.log"
 
 mkdir -p "$LOG_DIR"
 
@@ -39,16 +42,18 @@ mkdir -p "$LOG_DIR"
 TOTAL=0; SUCCESS=0; CF_FAILED=0; FAILED=0
 
 # ── Global Maps ───────────────────────────────────────────────────────────────
-declare -A G_USER_DOMAINS=()   # cpanel_user → comma-separated domain list
-declare -A G_DOMAIN_USER=()    # domain → cpanel_user
+declare -A G_DOMAIN_USER=()     # domain → cpanel_user
+declare -A G_USER_DOMAINS=()    # cpanel_user → comma-sep domain list
+declare -A G_DOMAIN_DOCROOT=()  # domain → pre-computed docroot (parked/alias/addon จาก userdatadomains)
 
 ###############################################################################
-# Logging
+# Logging — เขียนทับด้วย > ตอน init, append ด้วย tee -a ระหว่าง run
 ###############################################################################
 log()      { echo -e "$1" | tee -a "$LOG_FILE"; }
 log_fail() { echo -e "$1" | tee -a "$LOG_FILE" -a "$FAIL_LOG"; }
 
 log_init() {
+    # เขียนทับไฟล์ใหม่ทุกครั้งที่รัน
     {
         printf "╔══════════════════════════════════════════════════════════╗\n"
         printf "║  LiteSpeed Purge All v%-33s║\n" "${VERSION}"
@@ -58,6 +63,8 @@ log_init() {
         printf "╚══════════════════════════════════════════════════════════╝\n"
         echo ""
     } > "$LOG_FILE"
+    # เขียนทับ fail log ด้วย
+    > "$FAIL_LOG"
 }
 
 ###############################################################################
@@ -77,12 +84,11 @@ print_header() {
 ###############################################################################
 spinner_start() {
     local label="$1"
-    printf "  ${CYAN}%s${RESET} " "$label"
     (
         local sp='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' si=0
         while true; do
             si=$(( (si+1) % 10 ))
-            printf "\r  ${CYAN}%s${RESET} ${YELLOW}%s${RESET}" \
+            printf "\r  ${CYAN}%-55s${RESET} ${YELLOW}%s${RESET}" \
                 "$label" "${sp:$si:1}"
             sleep 0.1
         done
@@ -93,7 +99,7 @@ spinner_start() {
 
 spinner_stop() {
     [[ -n "${SPINNER_PID:-}" ]] && kill "$SPINNER_PID" 2>/dev/null
-    printf "\r\033[K"  # clear spinner line
+    printf "\r\033[K"
     SPINNER_PID=""
 }
 
@@ -105,7 +111,6 @@ check_requirements() {
         echo -e "${RED}[ERROR]${RESET} กรุณารันด้วย root"; exit 1
     }
 
-    # หา WP-CLI
     WP_CLI=""
     for p in /usr/local/bin/wp /usr/bin/wp /root/bin/wp; do
         [[ -x "$p" ]] && WP_CLI="$p" && break
@@ -123,22 +128,127 @@ check_requirements() {
 }
 
 ###############################################################################
-# Build domain → user map จาก /etc/userdomains
+# Build domain map — อ่านจาก userdomains + trueuserdomains + userdatadomains
+#
+# กรองออก:
+#   1. บรรทัดที่ user = nobody
+#   2. domain ขึ้นต้นด้วย * (wildcard)
+#   3. domain ลงท้ายด้วย .cp (cPanel internal proxy)
+#   4. cPanel internal subdomains (mail./ftp./cpanel./webmail./whm. ฯลฯ)
+#   5. main domain (อยู่ใน /etc/trueuserdomains)
+#   6. sub-type domain ที่ cPanel สร้างเอง (type=sub ใน userdatadomains)
+#      และ domain ที่ลงท้ายด้วย .mainDomain แต่ type ไม่ใช่ addon
+#
+# Parked / Alias:
+#   - type=parked หรือ alias ใน userdatadomains
+#   - ใช้ docroot ของ parent domain (แชร์ WordPress เดียวกัน)
+#   - ชื่อ domain ที่แสดงใน log = ชื่อ alias/parked domain เสมอ
 ###############################################################################
 build_domain_map() {
     G_DOMAIN_USER=()
     G_USER_DOMAINS=()
+    G_DOMAIN_DOCROOT=()
 
+    # ── Step 1: โหลด main domains จาก /etc/trueuserdomains ─────────────────
+    declare -A _MAIN=()   # main_domain → cpanel_user
+    while IFS=': ' read -r dom usr; do
+        [[ -z "$dom" || "$dom" =~ ^[#[:space:]] ]] && continue
+        dom="${dom%%[[:space:]]*}"
+        _MAIN["$dom"]="$usr"
+    done < /etc/trueuserdomains
+
+    # ── Step 2: โหลด type + docroot จาก /etc/userdatadomains ──────────────
+    # Format: domain.tld: cpuser==rootdomain.tld==type==docroot
+    # awk -F'==' ให้ $1=cpuser, $2=rootdomain, $3=type, $4=docroot
+    declare -A _TYPE=()        # domain → type (main/addon/parked/alias/sub)
+    declare -A _DOCROOT_UDD=() # domain → docroot
+    declare -A _PARENT_DOM=()  # domain → parent/root domain
+
+    if [[ -f /etc/userdatadomains ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            local udd_dom udd_rest udd_cpuser udd_root udd_type udd_docroot
+            udd_dom="${line%%:*}"
+            udd_dom="${udd_dom// /}"
+            udd_rest="${line#*: }"
+            # split by == using awk
+            udd_cpuser=$(awk  -F'==' '{print $1}' <<< "$udd_rest")
+            udd_root=$(awk    -F'==' '{print $2}' <<< "$udd_rest")
+            udd_type=$(awk    -F'==' '{print $3}' <<< "$udd_rest")
+            udd_docroot=$(awk -F'==' '{print $4}' <<< "$udd_rest")
+            # trim whitespace
+            udd_type="${udd_type// /}"
+            udd_docroot="${udd_docroot// /}"
+            udd_root="${udd_root// /}"
+
+            [[ -z "$udd_dom" ]] && continue
+            _TYPE["$udd_dom"]="$udd_type"
+            [[ -n "$udd_docroot" ]] && _DOCROOT_UDD["$udd_dom"]="$udd_docroot"
+            [[ -n "$udd_root"    ]] && _PARENT_DOM["$udd_dom"]="$udd_root"
+        done < /etc/userdatadomains
+    fi
+
+    # ── Step 3: อ่าน /etc/userdomains และกรองด้วย logic ครบ ──────────────
     while IFS=': ' read -r domain cpuser; do
-        [[ -z "$domain" || "$domain" =~ ^# ]] && continue
-        [[ "$domain" == "localhost" ]] && continue
-        # ข้าม sub-domain ที่ cPanel สร้างเอง
-        [[ "$domain" =~ ^(mail|ftp|cpanel|webmail|whm|cpcalendars|cpcontacts)\. ]] \
+        # trim
+        domain="${domain%%[[:space:]]*}"
+        cpuser="${cpuser%%[[:space:]]*}"
+
+        # ── Basic filters ──────────────────────────────────────────────────
+        [[ -z "$domain" || "$domain" =~ ^# ]]  && continue
+        [[ "$domain" == "localhost" ]]          && continue
+        [[ "$cpuser" == "nobody" ]]             && continue    # กรอง nobody
+        [[ "$domain" == \** ]]                  && continue    # กรอง wildcard
+        [[ "$domain" =~ \.cp$ ]]                && continue    # กรอง .cp proxy
+        [[ "$domain" =~ [[:space:]:\"] ]]       && continue    # กรอง garbage
+
+        # ── cPanel internal subdomain prefix ──────────────────────────────
+        [[ "$domain" =~ ^(mail|ftp|cpanel|webmail|whm|cpcalendars|cpcontacts|autodiscover|www)\. ]] \
             && continue
 
-        G_DOMAIN_USER["$domain"]="$cpuser"
+        # ── กรอง main domain (อยู่ใน trueuserdomains) ────────────────────
+        [[ -n "${_MAIN[$domain]+x}" ]] && continue
 
-        # สร้าง per-user domain list
+        # ── กรอง cPanel-created subdomain ────────────────────────────────
+        # ตรวจว่า domain ลงท้ายด้วย .mainDomain และ type = sub
+        local parent_label="${domain#*.}"   # abc.example.com → example.com
+        local dtype="${_TYPE[$domain]:-}"
+
+        if [[ "$dtype" == "sub" ]]; then
+            # cPanel-created subdomain → ข้าม
+            continue
+        fi
+
+        if [[ -n "${_MAIN[$parent_label]+x}" && -z "$dtype" ]]; then
+            # ลงท้ายด้วย main domain แต่ไม่มีใน userdatadomains เลย
+            # น่าจะเป็น cPanel subdomain เก่า → ข้าม
+            continue
+        fi
+
+        # ── จัดการ Parked / Alias ─────────────────────────────────────────
+        if [[ "$dtype" == "parked" || "$dtype" == "alias" ]]; then
+            # หา docroot ของ parent domain
+            local par_dom="${_PARENT_DOM[$domain]:-}"
+            local par_docroot=""
+
+            # ลอง docroot จาก userdatadomains ของ parent ก่อน
+            if [[ -n "$par_dom" && -n "${_DOCROOT_UDD[$par_dom]+x}" ]]; then
+                par_docroot="${_DOCROOT_UDD[$par_dom]}"
+            else
+                # fallback: ใช้ docroot ของ parked/alias domain เอง (อาจเป็น parent)
+                par_docroot="${_DOCROOT_UDD[$domain]:-}"
+            fi
+
+            [[ -n "$par_docroot" ]] && G_DOMAIN_DOCROOT["$domain"]="$par_docroot"
+            # ยังคง add domain เข้า map (ชื่อ alias domain ไม่ใช่ parent)
+        else
+            # addon/main-addon: ใช้ docroot จาก userdatadomains ถ้ามี
+            [[ -n "${_DOCROOT_UDD[$domain]+x}" ]] \
+                && G_DOMAIN_DOCROOT["$domain"]="${_DOCROOT_UDD[$domain]}"
+        fi
+
+        # ── เพิ่มเข้า domain map ──────────────────────────────────────────
+        G_DOMAIN_USER["$domain"]="$cpuser"
         if [[ -n "${G_USER_DOMAINS[$cpuser]+x}" ]]; then
             G_USER_DOMAINS["$cpuser"]+=",$domain"
         else
@@ -154,37 +264,65 @@ get_cpanel_users() {
     local -n _out=$1
     _out=()
     local -A _seen=()
-    while IFS=': ' read -r domain cpuser; do
-        [[ -z "$cpuser" || "$cpuser" =~ ^# ]] && continue
+    # ดึงเฉพาะ user ที่มีอยู่ใน G_USER_DOMAINS
+    for cpuser in "${!G_USER_DOMAINS[@]}"; do
         [[ -z "${_seen[$cpuser]+x}" ]] && _seen["$cpuser"]=1 && _out+=("$cpuser")
-    done < /etc/userdomains
+    done
     mapfile -t _out < <(printf '%s\n' "${_out[@]}" | sort -u)
 }
 
 ###############################################################################
-# Get WP document root
+# Get WP document root — รองรับ 2 path structures + docroot จาก userdatadomains
+#
+#  Priority:
+#  1. G_DOMAIN_DOCROOT map (pre-computed จาก userdatadomains — parked/alias/addon)
+#  2. whmapi1 domainuserdata
+#  3. /home/USER/public_html/DOMAIN/   (แบบที่ 2)
+#  4. /home/USER/DOMAIN/               (แบบที่ 1)
 ###############################################################################
 get_wp_path() {
     local domain="$1" cpanel_user="$2"
-    local docroot home_dir
+    local docroot=""
+    local home_dir
+    home_dir=$(getent passwd "$cpanel_user" 2>/dev/null | cut -d: -f6)
+    [[ -z "$home_dir" ]] && home_dir="/home/${cpanel_user}"
 
+    # ── Priority 1: pre-computed docroot จาก userdatadomains ──────────────
+    if [[ -n "${G_DOMAIN_DOCROOT[$domain]+x}" ]]; then
+        docroot="${G_DOMAIN_DOCROOT[$domain]}"
+        if [[ -f "${docroot}/wp-config.php" ]]; then
+            echo "$docroot"; return
+        fi
+    fi
+
+    # ── Priority 2: whmapi1 domainuserdata ───────────────────────────────
     docroot=$(whmapi1 --output=jsonpretty domainuserdata \
         domain="$domain" 2>/dev/null \
         | python3 -c "
 import sys,json
-d=json.load(sys.stdin)
-print(d.get('data',{}).get('userdata',{}).get('documentroot',''))
+try:
+    d=json.load(sys.stdin)
+    print(d.get('data',{}).get('userdata',{}).get('documentroot',''))
+except:
+    print('')
 " 2>/dev/null)
-
-    if [[ -z "$docroot" || ! -f "${docroot}/wp-config.php" ]]; then
-        home_dir=$(getent passwd "$cpanel_user" 2>/dev/null | cut -d: -f6)
-        [[ -z "$home_dir" ]] && home_dir="/home/${cpanel_user}"
-        [[ -f "${home_dir}/public_html/wp-config.php" ]] \
-            && docroot="${home_dir}/public_html"
-        [[ -f "${home_dir}/public_html/${domain}/wp-config.php" ]] \
-            && docroot="${home_dir}/public_html/${domain}"
+    docroot="${docroot// /}"
+    if [[ -n "$docroot" && -f "${docroot}/wp-config.php" ]]; then
+        echo "$docroot"; return
     fi
-    echo "$docroot"
+
+    # ── Priority 3: /home/USER/public_html/DOMAIN/ (แบบที่ 2) ────────────
+    if [[ -f "${home_dir}/public_html/${domain}/wp-config.php" ]]; then
+        echo "${home_dir}/public_html/${domain}"; return
+    fi
+
+    # ── Priority 4: /home/USER/DOMAIN/ (แบบที่ 1) ─────────────────────────
+    if [[ -f "${home_dir}/${domain}/wp-config.php" ]]; then
+        echo "${home_dir}/${domain}"; return
+    fi
+
+    # ── ไม่เจอ ───────────────────────────────────────────────────────────
+    echo ""
 }
 
 ###############################################################################
@@ -194,12 +332,14 @@ check_cf_configured() {
     local wp_path="$1" cpanel_user="$2"
     local cf_token=""
 
+    # ลอง litespeed-option get ก่อน (official CLI)
     cf_token=$(sudo -u "$cpanel_user" \
         "$WP_CLI" --path="$wp_path" \
         litespeed-option get cdn-cloudflare_token 2>/dev/null \
         | grep -v "^Error:" | grep -v "^Warning:" \
         | tr -d '[:space:]')
 
+    # Fallback: อ่าน litespeed.conf array โดยตรง
     if [[ -z "$cf_token" || "$cf_token" == "0" ]]; then
         cf_token=$(sudo -u "$cpanel_user" \
             "$WP_CLI" --path="$wp_path" eval \
@@ -272,7 +412,7 @@ purge_domain() {
     log "     User : ${cpanel_user}"
     log "     Time : $(TZ='Asia/Bangkok' date '+%Y-%m-%d %H:%M:%S')"
 
-    # ── Validate ──────────────────────────────────
+    # ── Validate ──────────────────────────────────────────────────────────
     if [[ -z "$cpanel_user" ]]; then
         log_fail "${RED}  [ERROR] ไม่พบ cPanel user: ${domain}${RESET}"
         ((FAILED++)); return
@@ -282,16 +422,17 @@ purge_domain() {
         ((FAILED++)); return
     fi
 
+    # ── Find WP path ──────────────────────────────────────────────────────
     local wp_path
     wp_path=$(get_wp_path "$domain" "$cpanel_user")
     if [[ -z "$wp_path" || ! -f "${wp_path}/wp-config.php" ]]; then
-        log_fail "${RED}  [ERROR] ไม่พบ wp-config.php: '${wp_path}'${RESET}"
+        log_fail "${RED}  [ERROR] ไม่พบ wp-config.php สำหรับ ${domain}${RESET}"
         ((FAILED++)); return
     fi
     log "     Path : ${wp_path}"
 
-    # ── Plugin active check ──────────────────────
-    # ใช้ "Status: active" ไม่ใช่ "active" เพราะ "Inactive" ก็มี substring "active"
+    # ── Plugin active check ───────────────────────────────────────────────
+    # ใช้ "Status: active" ไม่ใช่ "active" เพราะ "Inactive" มี substring "active"
     if ! sudo -u "$cpanel_user" \
         "$WP_CLI" --path="$wp_path" \
         plugin status litespeed-cache 2>&1 | grep -qi "Status: active"; then
@@ -299,16 +440,17 @@ purge_domain() {
         ((FAILED++)); return
     fi
 
-    # ── CF configured? ───────────────────────────
+    # ── CF configured? ────────────────────────────────────────────────────
     local cf_configured
     cf_configured=$(check_cf_configured "$wp_path" "$cpanel_user")
     log "     CF   : $([ "$cf_configured" = "1" ] \
         && echo "Configured" || echo "Not configured")"
 
-    # ════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # STEP 1: wp litespeed-purge all
-    # exit 0 + "Success:" = OK | exit 1 + "Error:" = FAIL
-    # ════════════════════════════════════════════
+    # WP-CLI convention: exit 0 + "Success:" = OK
+    #                    exit 1 + "Error:"   = FAIL
+    # ════════════════════════════════════════════════════════════════════
     local purge_output purge_exit
     purge_output=$(sudo -u "$cpanel_user" \
         "$WP_CLI" --path="$wp_path" --url="https://${domain}" \
@@ -329,9 +471,9 @@ purge_domain() {
         return
     fi
 
-    # ════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # STEP 2: CF notices from DB (เฉพาะถ้า CF configured)
-    # ════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     if [[ "$cf_configured" == "0" ]]; then
         log "     ${GREEN}${BOLD}→ RESULT: SUCCESS${RESET}"
         ((SUCCESS++))
@@ -341,44 +483,113 @@ purge_domain() {
     local notices
     notices=$(read_ls_notices "$wp_path" "$cpanel_user")
 
-    local cf_comm_ok=0 cf_purge_ok=0 cf_error_msg=""
+    # ── Exact strings จาก cloudflare.cls.php (verified บน server จริง) ──
+    #
+    # SUCCESS:
+    #   "Communicated with Cloudflare successfully."   line 298
+    #   "Notified Cloudflare to purge all successfully." line 167
+    #
+    # ERRORS:
+    #   "No available Cloudflare zone"                 line 181 — Zone ID ว่าง
+    #   "Failed to communicate with Cloudflare"        line ~290,305 — HTTP/API fail
+    #   "Cloudflare API is set to off."                line ~153 — toggle OFF
+    # ─────────────────────────────────────────────────────────────────────
+    local cf_comm_ok=0  cf_purge_ok=0
+    local cf_zone_missing=0  cf_conn_failed=0  cf_api_off=0
 
-    echo "$notices" | grep -qi "Communicated with Cloudflare successfully" \
-        && cf_comm_ok=1
-    echo "$notices" | grep -qi "Notified Cloudflare to purge all successfully" \
-        && cf_purge_ok=1
-    cf_error_msg=$(echo "$notices" \
-        | grep -i "cloudflare" \
-        | grep -i "ERROR:\|fail\|invalid\|unauthorized\|forbidden\|timeout" \
-        | head -1)
+    echo "$notices" | grep -qF "Communicated with Cloudflare successfully."    && cf_comm_ok=1
+    echo "$notices" | grep -qF "Notified Cloudflare to purge all successfully." && cf_purge_ok=1
+    echo "$notices" | grep -qF "No available Cloudflare zone"                  && cf_zone_missing=1
+    echo "$notices" | grep -qF "Failed to communicate with Cloudflare"         && cf_conn_failed=1
+    echo "$notices" | grep -qF "Cloudflare API is set to off."                 && cf_api_off=1
 
+    # ── Result logic ──────────────────────────────────────────────────────
     if [[ $cf_comm_ok -eq 1 && $cf_purge_ok -eq 1 ]]; then
         log "     ${GREEN}[✓] Communicated with Cloudflare successfully.${RESET}"
         log "     ${GREEN}[✓] Notified Cloudflare to purge all successfully.${RESET}"
-        log "     ${GREEN}${BOLD}→ RESULT: SUCCESS (CF confirmed)${RESET}"
+        log "     ${GREEN}${BOLD}→ RESULT: SUCCESS (LS + CF purge confirmed)${RESET}"
         ((SUCCESS++))
 
-    elif [[ $cf_comm_ok -eq 1 && $cf_purge_ok -eq 0 ]]; then
-        log_fail "     ${GREEN}[✓] Communicated with Cloudflare successfully.${RESET}"
-        log_fail "     ${RED}[✗] Notified Cloudflare to purge all — FAILED${RESET}"
-        [[ -n "$cf_error_msg" ]] && log_fail "     ${RED}    ${cf_error_msg}${RESET}"
-        log_fail "     ${RED}${BOLD}→ RESULT: CF PURGE FAILED${RESET}"
+    elif [[ $cf_zone_missing -eq 1 ]]; then
+        log_fail ""
+        log_fail "${RED}  ┌─ CF ERROR ──────────────────────────────────────${RESET}"
+        log_fail "${RED}  │  Domain : ${domain}${RESET}"
+        log_fail "${RED}  │  User   : ${cpanel_user}${RESET}"
+        log_fail "${RED}  │  Error  : No available Cloudflare zone${RESET}"
+        log_fail "${RED}  │  Cause  : Zone ID ไม่มีข้อมูลใน LiteSpeed plugin${RESET}"
+        log_fail "${RED}  │  Fix    : Zone ID ไม่มีข้อมูล${RESET}"
+        log_fail "${RED}  │           โปรดรัน Script Cloudflare Zone เพื่อแก้ไขปัญหา${RESET}"
+        log_fail "${RED}  └─────────────────────────────────────────────────${RESET}"
+        log_fail "     ${RED}${BOLD}→ RESULT: CF_ZONE_MISSING${RESET}"
         ((CF_FAILED++))
 
-    elif [[ $cf_comm_ok -eq 0 && -n "$cf_error_msg" ]]; then
-        log_fail "     ${RED}[✗] Communicated with Cloudflare — FAILED${RESET}"
-        log_fail "     ${RED}    ${cf_error_msg}${RESET}"
-        log_fail "     ${RED}${BOLD}→ RESULT: CF CONNECTION FAILED${RESET}"
+    elif [[ $cf_conn_failed -eq 1 ]]; then
+        log_fail ""
+        log_fail "${RED}  ┌─ CF ERROR ──────────────────────────────────────${RESET}"
+        log_fail "${RED}  │  Domain : ${domain}${RESET}"
+        log_fail "${RED}  │  User   : ${cpanel_user}${RESET}"
+        log_fail "${RED}  │  Error  : Failed to communicate with Cloudflare${RESET}"
+        log_fail "${RED}  │  Cause  : HTTP request หรือ CF API response ล้มเหลว${RESET}"
+        log_fail "${RED}  │  Fix    : ตรวจ API Token/Key — ต้องมีสิทธิ์ Zone:Cache Purge${RESET}"
+        log_fail "${RED}  └─────────────────────────────────────────────────${RESET}"
+        log_fail "     ${RED}${BOLD}→ RESULT: CF_CONN_FAILED${RESET}"
+        ((CF_FAILED++))
+
+    elif [[ $cf_api_off -eq 1 ]]; then
+        log_fail ""
+        log_fail "${YELLOW}  ┌─ CF WARNING ────────────────────────────────────${RESET}"
+        log_fail "${YELLOW}  │  Domain : ${domain}${RESET}"
+        log_fail "${YELLOW}  │  User   : ${cpanel_user}${RESET}"
+        log_fail "${YELLOW}  │  Error  : Cloudflare API is set to off.${RESET}"
+        log_fail "${YELLOW}  │  Cause  : LiteSpeed plugin มี CF token แต่ toggle OFF${RESET}"
+        log_fail "${YELLOW}  │  Fix    : LiteSpeed Cache → CDN → Cloudflare API → ON${RESET}"
+        log_fail "${YELLOW}  └─────────────────────────────────────────────────${RESET}"
+        log_fail "     ${YELLOW}${BOLD}→ RESULT: CF_DISABLED${RESET}"
+        ((CF_FAILED++))
+
+    elif [[ $cf_comm_ok -eq 1 && $cf_purge_ok -eq 0 ]]; then
+        log_fail ""
+        log_fail "${RED}  ┌─ CF ERROR ──────────────────────────────────────${RESET}"
+        log_fail "${RED}  │  Domain : ${domain}${RESET}"
+        log_fail "${RED}  │  User   : ${cpanel_user}${RESET}"
+        log_fail "${RED}  │  Error  : Communicated OK แต่ purge_cache ล้มเหลว${RESET}"
+        log_fail "${RED}  │  Cause  : CF API DELETE /purge_cache ไม่สำเร็จ${RESET}"
+        log_fail "${RED}  │  Fix    : ตรวจ Token permission ต้องมี Cache Purge${RESET}"
+        log_fail "${RED}  └─────────────────────────────────────────────────${RESET}"
+        log_fail "     ${RED}${BOLD}→ RESULT: CF_PURGE_FAILED${RESET}"
         ((CF_FAILED++))
 
     else
-        log_fail "     ${YELLOW}[?] CF configured แต่ไม่มี Cloudflare notices ใน DB${RESET}"
-        log_fail "     ${YELLOW}    สาเหตุที่เป็นไปได้:${RESET}"
-        log_fail "     ${YELLOW}    - CF API token หมดอายุ / ไม่มีสิทธิ์ Cache Purge${RESET}"
-        log_fail "     ${YELLOW}    - LiteSpeed CF integration ปิดอยู่ใน plugin settings${RESET}"
-        log_fail "     ${YELLOW}    - Notices ถูก clear ก่อน script อ่านได้${RESET}"
-        log_fail "     ${YELLOW}${BOLD}→ RESULT: CF UNCONFIRMED${RESET}"
+        log_fail ""
+        log_fail "${YELLOW}  ┌─ CF UNCONFIRMED ────────────────────────────────${RESET}"
+        log_fail "${YELLOW}  │  Domain : ${domain}${RESET}"
+        log_fail "${YELLOW}  │  User   : ${cpanel_user}${RESET}"
+        log_fail "${YELLOW}  │  Status : LS purge สำเร็จ แต่ตรวจ CF ไม่ได้${RESET}"
+        log_fail "${YELLOW}  │  Cause  : ไม่มี CF notices ใน DB หลัง purge${RESET}"
+        log_fail "${YELLOW}  │           (O_CDN_CLOUDFLARE_CLEAR=false หรือ notices หาย)${RESET}"
+        log_fail "${YELLOW}  └─────────────────────────────────────────────────${RESET}"
+        log_fail "     ${YELLOW}${BOLD}→ RESULT: CF_UNCONFIRMED${RESET}"
         ((CF_FAILED++))
+    fi
+}
+
+###############################################################################
+# Show result line หลัง spinner หยุด
+###############################################################################
+show_domain_result() {
+    local domain="$1"
+    local result_line
+    result_line=$(grep "→ RESULT:" "$LOG_FILE" 2>/dev/null | tail -1)
+    local result_tag="${result_line##*RESULT: }"
+
+    if echo "$result_line" | grep -q "SUCCESS"; then
+        echo -e "  ${GREEN}[✓]${RESET} ${domain}"
+    elif echo "$result_line" | grep -q "FAILED\|CF_"; then
+        echo -e "  ${RED}[✗]${RESET} ${domain}  ${DIM}${result_tag}${RESET}"
+    elif echo "$result_line" | grep -q "UNCONFIRMED\|DISABLED"; then
+        echo -e "  ${YELLOW}[?]${RESET} ${domain}  ${DIM}${result_tag}${RESET}"
+    else
+        echo -e "  ${YELLOW}[?]${RESET} ${domain}"
     fi
 }
 
@@ -387,28 +598,18 @@ purge_domain() {
 ###############################################################################
 process_all_server() {
     log "Mode : All domains on server"
-    local count=0
-    for domain in "${!G_DOMAIN_USER[@]}"; do
-        count=$(( count + 1 ))
-    done
-
+    local -a all_domains=()
+    mapfile -t all_domains < <(printf '%s\n' "${!G_DOMAIN_USER[@]}" | sort)
+    local count="${#all_domains[@]}"
     local i=0
-    for domain in $(echo "${!G_DOMAIN_USER[@]}" | tr ' ' '\n' | sort); do
+
+    for domain in "${all_domains[@]}"; do
         local cpuser="${G_DOMAIN_USER[$domain]}"
         ((i++))
         spinner_start "[${i}/${count}] ${domain}"
-        purge_domain "$domain" "$cpuser" 2>/dev/null
+        purge_domain "$domain" "$cpuser"
         spinner_stop
-        # แสดงผลสรุปของ domain นี้
-        local result_line
-        result_line=$(grep "→ RESULT:" "$LOG_FILE" 2>/dev/null | tail -1)
-        if echo "$result_line" | grep -q "SUCCESS"; then
-            echo -e "  ${GREEN}[✓]${RESET} ${domain}"
-        elif echo "$result_line" | grep -q "FAILED\|UNCONFIRMED"; then
-            echo -e "  ${RED}[✗]${RESET} ${domain}  ${DIM}${result_line##*RESULT: }${RESET}"
-        else
-            echo -e "  ${YELLOW}[?]${RESET} ${domain}"
-        fi
+        show_domain_result "$domain"
     done
 }
 
@@ -425,24 +626,18 @@ process_by_account() {
     fi
 
     log "Mode : Account → ${selected_user}"
+    local -a domain_list=()
     IFS=',' read -ra domain_list <<< "$domains_str"
+    mapfile -t domain_list < <(printf '%s\n' "${domain_list[@]}" | sort)
     local count="${#domain_list[@]}"
     local i=0
 
-    for domain in $(printf '%s\n' "${domain_list[@]}" | sort); do
+    for domain in "${domain_list[@]}"; do
         ((i++))
         spinner_start "[${i}/${count}] ${domain}"
-        purge_domain "$domain" "$selected_user" 2>/dev/null
+        purge_domain "$domain" "$selected_user"
         spinner_stop
-        local result_line
-        result_line=$(grep "→ RESULT:" "$LOG_FILE" 2>/dev/null | tail -1)
-        if echo "$result_line" | grep -q "SUCCESS"; then
-            echo -e "  ${GREEN}[✓]${RESET} ${domain}"
-        elif echo "$result_line" | grep -q "FAILED\|UNCONFIRMED"; then
-            echo -e "  ${RED}[✗]${RESET} ${domain}  ${DIM}${result_line##*RESULT: }${RESET}"
-        else
-            echo -e "  ${YELLOW}[?]${RESET} ${domain}"
-        fi
+        show_domain_result "$domain"
     done
 }
 
@@ -457,7 +652,7 @@ send_telegram() {
     end_time=$(TZ='Asia/Bangkok' date '+%Y-%m-%d %H:%M:%S')
     local status_icon="✅"
     [[ $FAILED -gt 0 || $CF_FAILED -gt 0 ]] && status_icon="⚠️"
-    [[ $FAILED -eq $TOTAL ]] && status_icon="❌"
+    [[ $FAILED -eq $TOTAL && $TOTAL -gt 0 ]] && status_icon="❌"
 
     local msg
     msg=$(cat <<EOF
@@ -466,7 +661,7 @@ ${status_icon} <b>LiteSpeed Purge All</b>
 🕐 เสร็จ: ${end_time}
 
 📊 ผลลัพธ์:
-├ Total   : ${TOTAL}
+├ Total      : ${TOTAL}
 ├ ✅ Success  : ${SUCCESS}
 ├ ⚠️ CF issue : ${CF_FAILED}
 └ ❌ Failed   : ${FAILED}
@@ -474,7 +669,6 @@ ${status_icon} <b>LiteSpeed Purge All</b>
 📄 Log: <code>${LOG_FILE}</code>
 EOF
 )
-
     curl -s -X POST \
         "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d chat_id="${TELEGRAM_CHAT_ID}" \
@@ -494,17 +688,16 @@ print_summary() {
     echo -e "${BLUE}════════════════════════════════════════════════${RESET}"
     echo -e "${WHITE}${BOLD}  LiteSpeed Purge All — SUMMARY${RESET}"
     echo -e "${BLUE}────────────────────────────────────────────────${RESET}"
-    printf "  %-22s : %s\n" "Total processed"    "${TOTAL}"
-    printf "  %-22s : ${GREEN}%s${RESET}\n" "✓ SUCCESS"       "${SUCCESS}"
-    printf "  %-22s : ${YELLOW}%s${RESET}\n" "△ CF issue (LS OK)" "${CF_FAILED}"
-    printf "  %-22s : ${RED}%s${RESET}\n" "✗ FAILED (LS fail)" "${FAILED}"
+    printf "  %-30s : %s\n"   "Total processed"           "${TOTAL}"
+    printf "  %-30s : ${GREEN}%s${RESET}\n"  "✓ SUCCESS"  "${SUCCESS}"
+    printf "  %-30s : ${YELLOW}%s${RESET}\n" "△ CF issue (LS purge OK)" "${CF_FAILED}"
+    printf "  %-30s : ${RED}%s${RESET}\n"    "✗ FAILED (LS purge fail)" "${FAILED}"
     echo -e "${BLUE}────────────────────────────────────────────────${RESET}"
-    echo -e "  Log  : ${DIM}${LOG_FILE}${RESET}"
+    echo -e "  Full log : ${DIM}${LOG_FILE}${RESET}"
     [[ $CF_FAILED -gt 0 || $FAILED -gt 0 ]] && \
-        echo -e "  Fail : ${RED}${FAIL_LOG}${RESET}"
+        echo -e "  Fail log : ${RED}${FAIL_LOG}${RESET}"
     echo -e "${BLUE}════════════════════════════════════════════════${RESET}"
 
-    # เขียน summary ลง log
     {
         echo ""
         echo "════════════════════════════════════════════════"
@@ -551,7 +744,7 @@ menu_select_account() {
     while true; do
         read -rp "  เลือกหมายเลข [1-${#users[@]}] หรือ [0] กลับ: " choice
         if [[ "$choice" == "0" ]]; then
-            return 1   # กลับ menu หลัก
+            return 1
         elif [[ "$choice" =~ ^[0-9]+$ ]] && \
              (( choice >= 1 && choice <= ${#users[@]} )); then
             SELECTED_USER="${users[$((choice-1))]}"
@@ -571,7 +764,7 @@ main_menu() {
 
         echo -e "  ${WHITE}${BOLD}เลือกโหมด Purge:${RESET}"
         echo ""
-        echo -e "  ${CYAN}[1]${RESET}  Purge ทุก Domain บนเซิร์ฟเวอร์"
+        echo -e "  ${CYAN}[1]${RESET}  Purge ทุก Domain บนเซิร์ฟเวอร์  ${DIM}(${#G_DOMAIN_USER[@]} domains)${RESET}"
         echo -e "  ${CYAN}[2]${RESET}  Purge เฉพาะ cPanel Account ที่เลือก"
         echo ""
         echo -e "  ${DIM}[0]  ออก${RESET}"
@@ -585,11 +778,13 @@ main_menu() {
             1)
                 echo ""
                 echo -e "  ${YELLOW}${BOLD}[Mode 1] Purge ทุก Domain บนเซิร์ฟเวอร์${RESET}"
-                echo -e "  ${DIM}จำนวน domain ที่จะ purge: ${#G_DOMAIN_USER[@]}${RESET}"
+                echo -e "  ${DIM}จำนวน: ${#G_DOMAIN_USER[@]} domains${RESET}"
                 echo ""
                 read -rp "  ยืนยัน? [y/N]: " confirm
                 [[ ! "$confirm" =~ ^[Yy]$ ]] && continue
                 echo ""
+                # Reset counters
+                TOTAL=0; SUCCESS=0; CF_FAILED=0; FAILED=0
                 log_init
                 process_all_server
                 print_summary
@@ -610,11 +805,13 @@ main_menu() {
                         IFS=',' read -ra _tmp <<< "${G_USER_DOMAINS[$SELECTED_USER]}"
                         dom_count="${#_tmp[@]}"
                     fi
-                    echo -e "  ${DIM}จำนวน domain: ${dom_count}${RESET}"
+                    echo -e "  ${DIM}จำนวน: ${dom_count} domains${RESET}"
                     echo ""
                     read -rp "  ยืนยัน? [y/N]: " confirm2
                     [[ ! "$confirm2" =~ ^[Yy]$ ]] && continue
                     echo ""
+                    # Reset counters
+                    TOTAL=0; SUCCESS=0; CF_FAILED=0; FAILED=0
                     log_init
                     process_by_account "$SELECTED_USER"
                     print_summary
@@ -644,7 +841,14 @@ main_menu() {
 ###############################################################################
 main() {
     check_requirements
+
+    # Loading spinner ขณะ build domain map
+    echo -ne "  ${CYAN}กำลังโหลดข้อมูล domain...${RESET} "
+    spinner_start "กำลังโหลดข้อมูล domain"
     build_domain_map
+    spinner_stop
+    echo -e "  ${GREEN}โหลดเสร็จ — พบ ${#G_DOMAIN_USER[@]} domains${RESET}"
+    sleep 0.5
 
     main_menu
 }
